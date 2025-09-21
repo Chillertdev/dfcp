@@ -544,4 +544,4 @@ ORDER BY
     repetition_count DESC;
 ### 📞 İletişim ve Kaynak Kodları
 
-- **GitHub Repository**: [DFCP Google News Scraper](https://github.com/Chillertdev/dfcp-google-news-scraper)
+- **GitHub Repository**: [DFCP Google News Scraper](https://github.com/Chillertdev/dfcp)
