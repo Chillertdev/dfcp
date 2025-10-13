@@ -163,7 +163,6 @@ Resources:
   RDSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: !Sub '${ProjectName}-rds-sg-${Environment}'
       GroupDescription: !Sub 'Security group for RDS MySQL - ${Environment}'
       SecurityGroupIngress:
         - IpProtocol: tcp
