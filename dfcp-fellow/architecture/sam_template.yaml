@@ -1,0 +1,451 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  DFCP Google News Scraper - Complete Infrastructure
+  Single template for both test and production environments
+  Author: Data Fellow | Region: eu-central-1
+
+# ============================================================================
+# PARAMETERS - Stack creation sırasında değer girilecek
+# ============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment (test or prod)
+    Default: test
+    AllowedValues:
+      - test
+      - prod
+  
+  ProjectName:
+    Type: String
+    Description: Project name prefix for all resources
+    Default: dfcp
+    MinLength: 2
+    MaxLength: 20
+  
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket name containing Lambda deployment package
+    Default: dfcp-deployment-bucket
+  
+  LambdaCodeKey:
+    Type: String
+    Description: S3 key path for Lambda zip file
+    Default: lambda/lambda_deployment.zip
+  
+  LayerCodeKey:
+    Type: String
+    Description: S3 key path for Lambda Layer zip file
+    Default: layers/python-dependencies.zip
+  
+  DBUsername:
+    Type: String
+    Description: RDS MySQL master username
+    Default: admin
+    MinLength: 1
+    MaxLength: 16
+  
+  DBPassword:
+    Type: String
+    Description: RDS MySQL master password (min 8 characters)
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+  
+  AlarmEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+# ============================================================================
+# MAPPINGS - Environment-specific configurations
+# ============================================================================
+Mappings:
+  EnvironmentConfig:
+    test:
+      LambdaMemory: 128
+      LambdaTimeout: 60
+      DBInstanceClass: db.t4g.micro
+      DBStorage: 20
+      S3LifecycleDays: 15
+      ErrorThreshold: 1
+    prod:
+      LambdaMemory: 256
+      LambdaTimeout: 60
+      DBInstanceClass: db.t4g.small
+      DBStorage: 50
+      S3LifecycleDays: 30
+      ErrorThreshold: 3
+
+# ============================================================================
+# CONDITIONS - Conditional resource configuration
+# ============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# ============================================================================
+# RESOURCES - AWS Infrastructure Components
+# ============================================================================
+Resources:
+  
+  # ==========================================================================
+  # S3 BUCKET - Scraped News Data Storage
+  # ==========================================================================
+  ScrapedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-scraped-bucket-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteOldObjects
+            Status: Enabled
+            ExpirationInDays: !FindInMap [EnvironmentConfig, !Ref Environment, S3LifecycleDays]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-scraped-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ==========================================================================
+  # RDS MYSQL DATABASE
+  # ==========================================================================
+  NewsDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    DependsOn: RDSSecurityGroup
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-news-db-${Environment}'
+      DBName: news_db
+      Engine: mysql
+      EngineVersion: '8.0.39'
+      DBInstanceClass: !FindInMap [EnvironmentConfig, !Ref Environment, DBInstanceClass]
+      AllocatedStorage: !FindInMap [EnvironmentConfig, !Ref Environment, DBStorage]
+      StorageType: gp3
+      StorageEncrypted: true
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:              # ← Bunu ekle
+      - !Ref RDSSecurityGroup
+      PubliclyAccessible: true
+      BackupRetentionPeriod: 0
+      MultiAZ: false
+      EnableCloudwatchLogsExports:
+        - error
+        - slowquery
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-news-db-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ==========================================================================
+  # RDS SECURITY GROUP
+  # ==========================================================================
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-rds-sg-${Environment}'
+      GroupDescription: !Sub 'Security group for RDS MySQL - ${Environment}'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+          Description: MySQL access from anywhere
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rds-sg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # ==========================================================================
+  # RDS Security Group Association
+  # ==========================================================================
+  DBSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: RDSSecurityGroup
+    Properties:
+      GroupId: !GetAtt RDSSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      CidrIp: 0.0.0.0/0
+  
+  # ==========================================================================
+  # IAM ROLE - Lambda Execution Role
+  # ==========================================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      Description: !Sub 'Execution role for Lambda function - ${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${ScrapedDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ScrapedDataBucket.Arn
+        - PolicyName: CloudWatchMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ==========================================================================
+  # LAMBDA LAYER - Python Dependencies
+  # ==========================================================================
+  PythonDependenciesLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ProjectName}-dependencies-${Environment}'
+      Description: Python dependencies (requests, beautifulsoup4, pymysql, python-dateutil, lxml)
+      Content:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LayerCodeKey
+      CompatibleRuntimes:
+        - python3.13
+        - python3.12
+        - python3.11
+      CompatibleArchitectures:
+        - x86_64
+  
+  # ==========================================================================
+  # LAMBDA FUNCTION - Google News Scraper
+  # ==========================================================================
+  GoogleNewsScraperLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaExecutionRole
+      - PythonDependenciesLayer
+      - NewsDatabase
+      - ScrapedDataBucket
+    Properties:
+      FunctionName: !Sub '${ProjectName}-lambda-function-${Environment}'
+      Description: !Sub 'Scrapes Google News hourly and stores to S3 and RDS - ${Environment}'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Architectures:
+        - x86_64
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Layers:
+        - !Ref PythonDependenciesLayer
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !FindInMap [EnvironmentConfig, !Ref Environment, LambdaMemory]
+      Timeout: !FindInMap [EnvironmentConfig, !Ref Environment, LambdaTimeout]
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          S3_BUCKET_NAME: !Ref ScrapedDataBucket
+          RDS_HOST: !GetAtt NewsDatabase.Endpoint.Address
+          RDS_PORT: !GetAtt NewsDatabase.Endpoint.Port
+          RDS_USERNAME: !Ref DBUsername
+          RDS_PASSWORD: !Ref DBPassword
+          RDS_DATABASE: news_db
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-function-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ==========================================================================
+  # CLOUDWATCH LOG GROUP - Lambda Logs
+  # ==========================================================================
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${GoogleNewsScraperLambda}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # ==========================================================================
+  # EVENTBRIDGE RULE - Hourly Trigger
+  # ==========================================================================
+  HourlyTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-googlenews-hourly-${Environment}'
+      Description: !Sub 'Triggers Lambda every hour to scrape Google News - ${Environment}'
+      State: ENABLED
+      ScheduleExpression: rate(1 hour)
+      Targets:
+        - Arn: !GetAtt GoogleNewsScraperLambda.Arn
+          Id: !Sub '${ProjectName}-lambda-target'
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
+  
+  # ==========================================================================
+  # LAMBDA PERMISSION - Allow EventBridge to Invoke Lambda
+  # ==========================================================================
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GoogleNewsScraperLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HourlyTriggerRule.Arn
+  
+  # ==========================================================================
+  # SNS TOPIC - Alarm Notifications
+  # ==========================================================================
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alarm-notifications-${Environment}'
+      DisplayName: !Sub 'DFCP Lambda Alarms - ${Environment}'
+      Subscription:
+        - Endpoint: !Ref AlarmEmail
+          Protocol: email
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ==========================================================================
+  # CLOUDWATCH ALARM - Lambda Errors
+  # ==========================================================================
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-error-alarm-${Environment}'
+      AlarmDescription: !Sub 'Alerts when Lambda function has errors - ${Environment}'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !FindInMap [EnvironmentConfig, !Ref Environment, ErrorThreshold]
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GoogleNewsScraperLambda
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      OKActions:
+        - !Ref AlarmNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ============================================================================
+# OUTPUTS - Stack Information
+# ============================================================================
+Outputs:
+  StackName:
+    Description: CloudFormation stack name
+    Value: !Ref AWS::StackName
+  
+  Environment:
+    Description: Deployment environment
+    Value: !Ref Environment
+  
+  S3BucketName:
+    Description: S3 bucket name for scraped news data
+    Value: !Ref ScrapedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Bucket'
+  
+  S3BucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt ScrapedDataBucket.Arn
+  
+  LambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref GoogleNewsScraperLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+  
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt GoogleNewsScraperLambda.Arn
+  
+  RDSEndpoint:
+    Description: RDS MySQL endpoint address
+    Value: !GetAtt NewsDatabase.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-RDSEndpoint'
+  
+  RDSPort:
+    Description: RDS MySQL port
+    Value: !GetAtt NewsDatabase.Endpoint.Port
+  
+  RDSIdentifier:
+    Description: RDS instance identifier
+    Value: !Ref NewsDatabase
+  
+  DatabaseName:
+    Description: MySQL database name
+    Value: news_db
+  
+  EventRuleName:
+    Description: EventBridge rule name
+    Value: !Ref HourlyTriggerRule
+  
+  EventRuleArn:
+    Description: EventBridge rule ARN
+    Value: !GetAtt HourlyTriggerRule.Arn
+  
+  SNSTopicArn:
+    Description: SNS topic ARN for alarm notifications
+    Value: !Ref AlarmNotificationTopic
+  
+  AlarmName:
+    Description: CloudWatch alarm name
+    Value: !Ref LambdaErrorAlarm
